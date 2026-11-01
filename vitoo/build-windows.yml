@@ -1,0 +1,226 @@
+name: Remote support client (Windows)
+
+# Builds «پشتیبانی ویتو», the gym-side remote support client, from a pinned upstream RustDesk
+# tag plus our thin overlay (remote-support/client/, docs/remote-support.md). Nothing is forked:
+# every run checks out rustdesk/rustdesk at the commit in overlay.json, applies apply.py
+# (which fails loudly if upstream moved), and builds the portable Windows x64 client.
+# Toolchain versions (Flutter, vcpkg commit, Rust, LLVM) are read from upstream's own
+# workflows AT THAT TAG, so bumping the tag is usually the whole upgrade.
+#
+# Runs on demand (Actions tab or `gh workflow run`) and on a push to a remote-client/** branch.
+# The result is an artifact; publishing it to gyms is a separate, signed step on the release
+# machine (remote-support/client/release.mjs), never done from CI.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['remote-client/**']
+
+concurrency:
+  group: remote-client-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.m.outputs.tag }}
+      commit: ${{ steps.m.outputs.commit }}
+      flutter: ${{ steps.m.outputs.flutter }}
+      bridge_flutter: ${{ steps.m.outputs.bridge_flutter }}
+      rust: ${{ steps.m.outputs.rust }}
+      llvm: ${{ steps.m.outputs.llvm }}
+      vcpkg: ${{ steps.m.outputs.vcpkg }}
+      frb: ${{ steps.m.outputs.frb }}
+      cargo_expand: ${{ steps.m.outputs.cargo_expand }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: remote-support/client
+      - id: m
+        name: Pinned upstream and its toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          o=remote-support/client/overlay.json
+          tag=$(jq -r .upstream_tag $o); commit=$(jq -r .upstream_commit $o)
+          real=$(git ls-remote https://github.com/rustdesk/rustdesk "refs/tags/$tag^{}" "refs/tags/$tag" | awk 'NR==1{print $1}')
+          # an annotated tag lists the tag object first and the commit as ^{}; prefer the commit
+          peeled=$(git ls-remote https://github.com/rustdesk/rustdesk "refs/tags/$tag^{}" | awk '{print $1}')
+          [ -n "$peeled" ] && real=$peeled
+          [ "$real" = "$commit" ] || { echo "::error::tag $tag is $real upstream, overlay.json pins $commit"; exit 1; }
+          raw=https://raw.githubusercontent.com/rustdesk/rustdesk/$commit/.github/workflows
+          curl -fsSL $raw/flutter-build.yml -o fb.yml; curl -fsSL $raw/bridge.yml -o br.yml
+          val() { grep -E "^\s*$1:" "$2" | head -1 | sed -E 's/^[^:]+:\s*"?([^" #]+)"?.*/\1/'; }
+          {
+            echo "tag=$tag"; echo "commit=$commit"
+            echo "flutter=$(val FLUTTER_VERSION fb.yml)"
+            echo "rust=$(val SCITER_RUST_VERSION fb.yml)"
+            echo "llvm=$(val LLVM_VERSION fb.yml)"
+            echo "vcpkg=$(val VCPKG_COMMIT_ID fb.yml)"
+            echo "frb=$(val FLUTTER_RUST_BRIDGE_VERSION br.yml)"
+            echo "cargo_expand=$(val CARGO_EXPAND_VERSION br.yml)"
+            echo "bridge_flutter=$(grep -oE 'flutter-version: "[0-9.]+"' br.yml | head -1 | grep -oE '[0-9.]+')"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  bridge:
+    # flutter_rust_bridge glue, generated exactly as upstream's bridge.yml does (our overlay
+    # does not touch the FFI, but it is applied first anyway so the tree matches the build).
+    needs: meta
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: vitoo
+          sparse-checkout: remote-support/client
+      - uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ needs.meta.outputs.commit }}
+          path: rustdesk
+          submodules: recursive
+      - run: python3 -I vitoo/remote-support/client/apply.py rustdesk
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang cmake curl gcc git g++ libclang-dev libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.meta.outputs.rust }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bridge-${{ needs.meta.outputs.tag }}
+          workspaces: rustdesk
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ needs.meta.outputs.bridge_flutter }}
+          cache: true
+      - name: Generate the bridge
+        working-directory: rustdesk
+        shell: bash
+        run: |
+          cargo install cargo-expand --version ${{ needs.meta.outputs.cargo_expand }} --locked
+          cargo install flutter_rust_bridge_codegen --version ${{ needs.meta.outputs.frb }} --features "uuid" --locked
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          pushd flutter && flutter pub get && popd
+          ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge
+          path: |
+            rustdesk/src/bridge_generated.rs
+            rustdesk/src/bridge_generated.io.rs
+            rustdesk/flutter/lib/generated_bridge.dart
+            rustdesk/flutter/lib/generated_bridge.freezed.dart
+
+  windows:
+    needs: [meta, bridge]
+    runs-on: windows-2022
+    env:
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+      VCPKG_COMMIT_ID: ${{ needs.meta.outputs.vcpkg }}
+    steps:
+      - name: Export GitHub Actions cache variables (vcpkg binary cache)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - uses: actions/checkout@v4
+        with:
+          path: vitoo
+          sparse-checkout: remote-support/client
+      - uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ needs.meta.outputs.commit }}
+          path: rustdesk
+          submodules: recursive
+      - name: Apply the Vitoo overlay
+        run: python3 -I vitoo/remote-support/client/apply.py rustdesk
+      - uses: actions/download-artifact@v4
+        with:
+          name: bridge
+          path: rustdesk
+      - uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: ${{ needs.meta.outputs.llvm }}
+      - id: flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ needs.meta.outputs.flutter }}
+          architecture: x64
+      - name: RustDesk's Flutter engine and patch (as upstream)
+        shell: pwsh
+        run: |
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile engine.zip
+          Expand-Archive -Path engine.zip -DestinationPath engine
+          $root = $env:FLUTTER_ROOT          # set by flutter-action; newer versions nest the SDK under /flutter
+          if (-not (Test-Path "$root/bin/cache/artifacts/engine/windows-x64-release")) { throw "no windows-x64-release engine under $root" }
+          Move-Item -Force engine/* "$root/bin/cache/artifacts/engine/windows-x64-release/"
+          $diff = "rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          if (("${{ needs.meta.outputs.flutter }}" -eq "3.24.5") -and (Test-Path $diff)) {
+            Copy-Item $diff $root; Push-Location $root; git apply flutter_3.24.4_dropdown_menu_enableFilter.diff; Pop-Location
+          }
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.meta.outputs.rust }}
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: win-${{ needs.meta.outputs.tag }}
+          workspaces: rustdesk
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ needs.meta.outputs.vcpkg }}
+          doNotCache: false
+      - name: vcpkg dependencies
+        working-directory: rustdesk
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          if ! $VCPKG_ROOT/vcpkg install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"; then
+            find "$VCPKG_ROOT/" -name "*.log" -newer vcpkg.json | head -20 | while read -r f; do echo "== $f"; tail -50 "$f"; done
+            exit 1
+          fi
+      - name: Build
+        working-directory: rustdesk
+        shell: pwsh
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          Move-Item ./flutter/build/windows/x64/runner/Release ./rustdesk
+          $r = Get-ChildItem -Recurse -Filter Runner.res | Select-Object -First 1
+          if ($r) { Copy-Item $r.FullName ./libs/portable/Runner.res }
+      - name: Settings, exe name, portable pack
+        working-directory: rustdesk
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp ../vitoo/remote-support/client/custom.txt ./rustdesk/custom.txt
+          mv ./rustdesk/rustdesk.exe ./rustdesk/vitoo-support.exe
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/vitoo-support.exe
+          popd
+          mkdir -p ../out
+          cp ./target/release/rustdesk-portable-packer.exe ../out/vitoo-support.exe
+          cd ../out
+          sha256sum vitoo-support.exe | tee vitoo-support.exe.sha256
+          echo "${{ needs.meta.outputs.tag }}" > upstream.txt
+          echo "${{ github.sha }}" > overlay-commit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vitoo-support-windows-x64-rustdesk-${{ needs.meta.outputs.tag }}
+          path: out
+          retention-days: 30
