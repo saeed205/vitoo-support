@@ -3,7 +3,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
     [
         ("Status", "وضعیت"),
         ("Your Desktop", "دسکتاپ شما"),
-        ("desk_tip", "دسکتاپ شما با این شناسه و رمز عبور قابل دسترسی است"),
+        ("desk_tip", "وقتی پشتیبان ویتو بخواهد وصل شود، پنجره‌ای باز می‌شود و تا شما نپذیرید کسی وارد نمی‌شود"),
         ("Password", "رمز عبور"),
         ("Ready", "آماده به کار"),
         ("Established", "اتصال برقرار شد"),
