@@ -639,9 +639,9 @@ class _DesktopTabState extends State<DesktopTab>
                           child: loadIcon(16),
                         ),
                         Offstage(
-                            offstage: !showTitle,
-                            child: const Text(
-                              "RustDesk",
+                            offstage: !showTitle && !bind.isIncomingOnly(),
+                            child: Text(
+                              bind.isIncomingOnly() ? "پشتیبانی ویتو" : "RustDesk",
                               style: TextStyle(fontSize: 13),
                             ).marginOnly(left: 2))
                       ]).marginOnly(
